@@ -9,7 +9,9 @@ use crate::bloom_filter::Sbbf;
 use crate::column::writer::{fallback_encoding, has_dictionary_support, update_max, update_min};
 use crate::data_type::DataType;
 use crate::data_type::private::ParquetValueType;
-use crate::encodings::encoding::{DictEncoder, Encoder, PlainEncoder, get_encoder_with_properties};
+use crate::encodings::encoding::{
+    DictEncoder, Encoder, PlainEncoder, get_encoder, get_encoder_with_properties,
+};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, ResolvedColumnProperties, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
@@ -465,6 +467,9 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
                     Some(plain) => {
                         let unencoded = plain.flush_buffer()?;
                         if unencoded.len() < encoded.len() {
+                            // A preset that loses to PLAIN on this page should not
+                            // constrain the next page's ALP parameter sampling.
+                            self.encoder = get_encoder(Encoding::ALP, &self.descr)?;
                             (unencoded, Encoding::PLAIN)
                         } else {
                             (encoded, encoding)
@@ -598,9 +603,9 @@ mod alp_fallback_tests {
 
     #[test]
     fn test_alp_falls_back_to_plain_for_high_entropy_values() {
-        let values: Vec<f64> = (0..8 * 1024)
+        let values: Vec<f64> = (0u64..8 * 1024)
             .map(|i| {
-                let x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                let x = i.wrapping_mul(0x9E3779B97F4A7C15);
                 f64::from_bits(0x3FF0000000000000 | (x >> 12))
             })
             .collect();
@@ -625,20 +630,17 @@ mod alp_fallback_tests {
         let page = encoder.flush_data_page().unwrap();
         assert_eq!(page.encoding, Encoding::PLAIN);
         assert_eq!(page.buf.len(), values.len() * std::mem::size_of::<f64>());
-        for (bytes, value) in page.buf.chunks_exact(8).zip(&values) {
-            assert_eq!(
-                u64::from_le_bytes(bytes.try_into().unwrap()),
-                value.to_bits()
-            );
+        for (bytes, value) in page.buf.as_chunks::<8>().0.iter().zip(&values) {
+            assert_eq!(u64::from_le_bytes(*bytes), value.to_bits());
         }
     }
 
     #[test]
     fn test_alp_keeps_compressed_decimals_and_falls_back_on_later_page() {
         let decimal_values: Vec<f64> = (0..2048).map(|i| i as f64 * 0.01).collect();
-        let random_values: Vec<f64> = (0..2048)
+        let random_values: Vec<f64> = (0u64..2048)
             .map(|i| {
-                let x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                let x = i.wrapping_mul(0x9E3779B97F4A7C15);
                 f64::from_bits(0x3FF0000000000000 | (x >> 12))
             })
             .collect();
@@ -669,5 +671,18 @@ mod alp_fallback_tests {
             .unwrap();
         let page = encoder.flush_data_page().unwrap();
         assert_eq!(page.encoding, Encoding::PLAIN);
+
+        let mut inverse =
+            ColumnValueEncoderImpl::<DoubleType>::try_new(&desc, &properties, &resolved).unwrap();
+        inverse
+            .write(&random_values, 0, random_values.len())
+            .unwrap();
+        assert_eq!(inverse.flush_data_page().unwrap().encoding, Encoding::PLAIN);
+        inverse
+            .write(&decimal_values, 0, decimal_values.len())
+            .unwrap();
+        let page = inverse.flush_data_page().unwrap();
+        assert_eq!(page.encoding, Encoding::ALP);
+        assert!(page.buf.len() < decimal_values.len() * 8 / 4);
     }
 }

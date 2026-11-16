@@ -5211,6 +5211,90 @@ mod tests {
     }
 
     #[test]
+    fn test_alp_fallback_pages_roundtrip_after_incompressible_first_page() {
+        let random_values: Vec<f64> = (0u64..2048)
+            .map(|i| {
+                let x = i.wrapping_mul(0x9E3779B97F4A7C15);
+                f64::from_bits(0x3FF0000000000000 | (x >> 12))
+            })
+            .collect();
+        let decimals: Vec<f64> = (0..2048).map(|i| i as f64 * 0.01).collect();
+        let values: Vec<f64> = random_values
+            .iter()
+            .chain(decimals.iter())
+            .chain(random_values.iter())
+            .copied()
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float64Array::from(values.clone()))],
+        )
+        .unwrap();
+        let writer_properties = |encoding| {
+            WriterProperties::builder()
+                .set_dictionary_enabled(false)
+                .set_encoding(encoding)
+                .set_compression(crate::basic::Compression::UNCOMPRESSED)
+                .set_data_page_row_count_limit(2048)
+                .build()
+        };
+        let mut writer = ArrowWriter::try_new(
+            Vec::new(),
+            schema.clone(),
+            Some(writer_properties(Encoding::ALP)),
+        )
+        .unwrap();
+        writer.write(&batch).unwrap();
+        let bytes = Bytes::from(writer.into_inner().unwrap());
+
+        let file_reader = SerializedFileReader::new(bytes.clone()).unwrap();
+        let column = file_reader.metadata().row_group(0).column(0);
+        let mut page_reader =
+            SerializedPageReader::new(Arc::new(bytes.clone()), column, values.len(), None).unwrap();
+        let mut encodings = Vec::new();
+        while let Some(page) = page_reader.get_next_page().unwrap() {
+            match page {
+                Page::DataPage { encoding, .. } | Page::DataPageV2 { encoding, .. } => {
+                    encodings.push(encoding)
+                }
+                Page::DictionaryPage { .. } => {}
+            }
+        }
+        assert_eq!(
+            encodings,
+            vec![Encoding::PLAIN, Encoding::ALP, Encoding::PLAIN]
+        );
+
+        let mut reader = ParquetRecordBatchReader::try_new(bytes.clone(), values.len()).unwrap();
+        let read = reader.next().unwrap().unwrap();
+        assert!(reader.next().is_none());
+        let read_values = read
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(read_values.len(), values.len());
+        assert!(
+            read_values
+                .values()
+                .iter()
+                .zip(&values)
+                .all(|(read, source)| read.to_bits() == source.to_bits())
+        );
+
+        let mut plain_writer =
+            ArrowWriter::try_new(Vec::new(), schema, Some(writer_properties(Encoding::PLAIN)))
+                .unwrap();
+        plain_writer.write(&batch).unwrap();
+        assert!(bytes.len() < plain_writer.into_inner().unwrap().len());
+    }
+
+    #[test]
     fn test_arrow_writer_skip_path_in_schema() {
         let batch_schema = Schema::new(vec![Field::new("int32", DataType::Int32, false)]);
         let file_schema = Arc::new(batch_schema.clone());
