@@ -5211,6 +5211,70 @@ mod tests {
     }
 
     #[test]
+    fn test_alp_high_entropy_file_never_exceeds_plain_with_compression() {
+        let values: Vec<f64> = (0u64..8 * 1024)
+            .map(|i| {
+                let x = i.wrapping_mul(0x9E3779B97F4A7C15);
+                f64::from_bits(0x3FF0000000000000 | (x >> 12))
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float64Array::from(values.clone()))],
+        )
+        .unwrap();
+
+        for compression in [
+            crate::basic::Compression::UNCOMPRESSED,
+            crate::basic::Compression::SNAPPY,
+            crate::basic::Compression::ZSTD(Default::default()),
+        ] {
+            let encode = |encoding| {
+                let props = WriterProperties::builder()
+                    .set_dictionary_enabled(false)
+                    .set_encoding(encoding)
+                    .set_compression(compression)
+                    .build();
+                let mut writer =
+                    ArrowWriter::try_new(Vec::new(), schema.clone(), Some(props)).unwrap();
+                writer.write(&batch).unwrap();
+                writer.into_inner().unwrap()
+            };
+            let plain = encode(Encoding::PLAIN);
+            let alp = encode(Encoding::ALP);
+            assert!(
+                alp.len() <= plain.len(),
+                "{compression:?}: ALP {} bytes, PLAIN {} bytes",
+                alp.len(),
+                plain.len()
+            );
+
+            let mut reader =
+                ParquetRecordBatchReader::try_new(Bytes::from(alp), values.len()).unwrap();
+            let decoded = reader.next().unwrap().unwrap();
+            assert!(reader.next().is_none());
+            let decoded = decoded
+                .column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap();
+            assert_eq!(decoded.len(), values.len());
+            assert!(
+                decoded
+                    .values()
+                    .iter()
+                    .zip(&values)
+                    .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+            );
+        }
+    }
+
+    #[test]
     fn test_alp_fallback_pages_roundtrip_after_incompressible_first_page() {
         let random_values: Vec<f64> = (0u64..2048)
             .map(|i| {
