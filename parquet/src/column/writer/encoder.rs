@@ -418,7 +418,13 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
     fn estimated_data_page_size(&self) -> usize {
         match &self.dict_encoder {
             Some(encoder) => encoder.estimated_data_encoded_size(),
-            _ => self.encoder.estimated_data_encoded_size(),
+            None => {
+                let encoded_size = self.encoder.estimated_data_encoded_size();
+                match &self.plain_fallback {
+                    Some(plain) => encoded_size.min(plain.estimated_data_encoded_size()),
+                    None => encoded_size,
+                }
+            }
         }
     }
 
@@ -615,6 +621,7 @@ mod alp_fallback_tests {
         let mut encoder =
             ColumnValueEncoderImpl::<DoubleType>::try_new(&desc, &properties, &resolved).unwrap();
         encoder.write(&values, 0, values.len()).unwrap();
+        assert_eq!(encoder.estimated_data_page_size(), values.len() * 8);
         let page = encoder.flush_data_page().unwrap();
         assert_eq!(page.encoding, Encoding::PLAIN);
         assert_eq!(page.buf.len(), values.len() * std::mem::size_of::<f64>());
