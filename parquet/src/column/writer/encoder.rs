@@ -9,7 +9,7 @@ use crate::bloom_filter::Sbbf;
 use crate::column::writer::{fallback_encoding, has_dictionary_support, update_max, update_min};
 use crate::data_type::DataType;
 use crate::data_type::private::ParquetValueType;
-use crate::encodings::encoding::{DictEncoder, Encoder, get_encoder_with_properties};
+use crate::encodings::encoding::{DictEncoder, Encoder, PlainEncoder, get_encoder_with_properties};
 use crate::errors::{ParquetError, Result};
 use crate::file::properties::{EnabledStatistics, ResolvedColumnProperties, WriterProperties};
 use crate::geospatial::accumulator::{GeoStatsAccumulator, try_new_geo_stats_accumulator};
@@ -196,6 +196,7 @@ pub trait ColumnValueEncoder {
 
 pub struct ColumnValueEncoderImpl<T: DataType> {
     encoder: Box<dyn Encoder<T>>,
+    plain_fallback: Option<PlainEncoder<T>>,
     dict_encoder: Option<DictEncoder<T>>,
     descr: ColumnDescPtr,
     num_values: usize,
@@ -247,7 +248,11 @@ impl<T: DataType> ColumnValueEncoderImpl<T> {
                         bloom_filter.insert(value);
                     }
                 }
-                self.encoder.put(slice)
+                self.encoder.put(slice)?;
+                if let Some(plain) = &mut self.plain_fallback {
+                    plain.put(slice)?;
+                }
+                Ok(())
             }
         }
     }
@@ -286,6 +291,8 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
             column_props,
         )?;
 
+        let plain_fallback = (encoder.encoding() == Encoding::ALP).then(PlainEncoder::new);
+
         let statistics_enabled = column_props.statistics_enabled;
 
         let (bloom_filter, bloom_filter_target_fpp) = create_bloom_filter(column_props)?;
@@ -294,6 +301,7 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
 
         Ok(Self {
             encoder,
+            plain_fallback,
             dict_encoder,
             descr: descr.clone(),
             num_values: 0,
@@ -395,7 +403,12 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
             .map(|bf| bf.estimated_memory_size())
             .unwrap_or_default();
 
-        encoder_size + dict_encoder_size + bloom_filter_size
+        let plain_fallback_size = self
+            .plain_fallback
+            .as_ref()
+            .map_or(0, |encoder| encoder.estimated_memory_size());
+
+        encoder_size + plain_fallback_size + dict_encoder_size + bloom_filter_size
     }
 
     fn estimated_dict_page_size(&self) -> Option<usize> {
@@ -439,7 +452,21 @@ impl<T: DataType> ColumnValueEncoder for ColumnValueEncoderImpl<T> {
     fn flush_data_page(&mut self) -> Result<DataPageValues<T::T>> {
         let (buf, encoding) = match &mut self.dict_encoder {
             Some(encoder) => (encoder.write_indices()?, Encoding::RLE_DICTIONARY),
-            _ => (self.encoder.flush_buffer()?, self.encoder.encoding()),
+            _ => {
+                let encoded = self.encoder.flush_buffer()?;
+                let encoding = self.encoder.encoding();
+                match &mut self.plain_fallback {
+                    Some(plain) => {
+                        let unencoded = plain.flush_buffer()?;
+                        if unencoded.len() < encoded.len() {
+                            (unencoded, Encoding::PLAIN)
+                        } else {
+                            (encoded, encoding)
+                        }
+                    }
+                    None => (encoded, encoding),
+                }
+            }
         };
 
         Ok(DataPageValues {
@@ -554,4 +581,86 @@ where
         }
     }
     Some(n)
+}
+
+#[cfg(test)]
+mod alp_fallback_tests {
+    use super::*;
+    use crate::data_type::DoubleType;
+    use crate::schema::types::{ColumnDescriptor, ColumnPath, Type as SchemaType};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_alp_falls_back_to_plain_for_high_entropy_values() {
+        let values: Vec<f64> = (0..8 * 1024)
+            .map(|i| {
+                let x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                f64::from_bits(0x3FF0000000000000 | (x >> 12))
+            })
+            .collect();
+        let ty = SchemaType::primitive_type_builder("t", Type::DOUBLE)
+            .build()
+            .unwrap();
+        let desc = Arc::new(ColumnDescriptor::new(
+            Arc::new(ty),
+            0,
+            0,
+            ColumnPath::from("t"),
+        ));
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_encoding(Encoding::ALP)
+            .build();
+        let resolved = properties.resolve_column_properties(&ColumnPath::from("t"));
+        let mut encoder =
+            ColumnValueEncoderImpl::<DoubleType>::try_new(&desc, &properties, &resolved).unwrap();
+        encoder.write(&values, 0, values.len()).unwrap();
+        let page = encoder.flush_data_page().unwrap();
+        assert_eq!(page.encoding, Encoding::PLAIN);
+        assert_eq!(page.buf.len(), values.len() * std::mem::size_of::<f64>());
+        for (bytes, value) in page.buf.chunks_exact(8).zip(&values) {
+            assert_eq!(
+                u64::from_le_bytes(bytes.try_into().unwrap()),
+                value.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn test_alp_keeps_compressed_decimals_and_falls_back_on_later_page() {
+        let decimal_values: Vec<f64> = (0..2048).map(|i| i as f64 * 0.01).collect();
+        let random_values: Vec<f64> = (0..2048)
+            .map(|i| {
+                let x = (i as u64).wrapping_mul(0x9E3779B97F4A7C15);
+                f64::from_bits(0x3FF0000000000000 | (x >> 12))
+            })
+            .collect();
+        let ty = SchemaType::primitive_type_builder("t", Type::DOUBLE)
+            .build()
+            .unwrap();
+        let desc = Arc::new(ColumnDescriptor::new(
+            Arc::new(ty),
+            0,
+            0,
+            ColumnPath::from("t"),
+        ));
+        let properties = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_encoding(Encoding::ALP)
+            .build();
+        let resolved = properties.resolve_column_properties(&ColumnPath::from("t"));
+        let mut encoder =
+            ColumnValueEncoderImpl::<DoubleType>::try_new(&desc, &properties, &resolved).unwrap();
+        encoder
+            .write(&decimal_values, 0, decimal_values.len())
+            .unwrap();
+        let page = encoder.flush_data_page().unwrap();
+        assert_eq!(page.encoding, Encoding::ALP);
+        assert!(page.buf.len() < decimal_values.len() * 8 / 4);
+        encoder
+            .write(&random_values, 0, random_values.len())
+            .unwrap();
+        let page = encoder.flush_data_page().unwrap();
+        assert_eq!(page.encoding, Encoding::PLAIN);
+    }
 }
